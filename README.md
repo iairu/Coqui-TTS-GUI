@@ -20,3 +20,13 @@ Subsequent runs:
 cd Coqui-TTS-GUI
 venv/bin/python gui.py
 ```
+
+## Audio
+
+Playback and recording are handled by `audio.py` and can be configured in the in-app **Settings** page:
+
+- **PulseAudio / PipeWire** (`pactl`, `paplay`/`pw-play`, `parecord`/`pw-record`), including WSLg's `/mnt/wslg/PulseServer`.
+- **ALSA** (`aplay`/`arecord`) when the machine has real sound cards.
+- **Windows host (WSL)**: plays/records through the Windows default device via PowerShell. Works on Ubuntu, Debian and Arch WSL without any Linux audio setup.
+
+"Automatic" picks the first working option in that order and ignores dummy PulseAudio outputs.

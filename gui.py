@@ -12,12 +12,16 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-try:
-    import simpleaudio as sa
-except Exception:  # playback is optional
-    sa = None
+# Silence the harmless "[transformers] Model config: bos_token_id ..." warnings from XTTS.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
+import audio
 import TTS.utils.manage as ttsmanage
+try:
+    import transformers
+    transformers.logging.set_verbosity_error()
+except Exception:
+    pass
 from TTS.utils.manage import ModelManager
 from TTS.utils.synthesizer import Synthesizer
 
@@ -202,33 +206,30 @@ def synth_worker(text, model, vocoder, cuda, lang, speaker, ref_wav, outfile, pl
         ui(refresh_controls)
 
 # ---------------------------------------------------------------- audio
+# Playback goes through the system sound server (PulseAudio/PipeWire, which WSLg provides)
+# instead of ALSA directly, because WSL has no ALSA sound card ("Unknown PCM default").
+audio_cfg = {"backend": settings.get("audio_backend", "auto"),
+             "output": settings.get("output_device", ""), "input": settings.get("input_device", "")}
+audio.set_pulse_server(settings.get("pulse_server", ""))
+
 def play_file(path):
     global play_obj
     stop_audio()
-    if sa is None:
-        messagebox.showwarning(APP_NAME, "Audio playback is unavailable (simpleaudio could not be loaded).")
-        return
     try:
-        play_obj = sa.WaveObject.from_wave_file(str(path)).play()
+        play_obj = audio.start_playback(path, audio_cfg["backend"], audio_cfg["output"])
     except Exception as e:
-        messagebox.showerror(APP_NAME, f"Could not play audio: {e}")
+        messagebox.showerror(APP_NAME, f"Could not play audio:\n{e}")
     refresh_controls()
 
 def stop_audio():
     global play_obj
-    if play_obj is not None:
-        try:
-            play_obj.stop()
-        except Exception:
-            pass
+    if play_obj is not None and play_obj.poll() is None:
+        play_obj.terminate()
     play_obj = None
     refresh_controls()
 
 def is_playing():
-    try:
-        return play_obj is not None and play_obj.is_playing()
-    except Exception:
-        return False
+    return play_obj is not None and play_obj.poll() is None
 
 # ---------------------------------------------------------------- model catalogue
 manager0 = ModelManager()
@@ -363,7 +364,9 @@ ttk.Label(header, text="Neural text-to-speech, offline on your machine", style="
 def toggle_theme():
     apply_theme("dark" if theme_name == "light" else "light")
 theme_button = ttk.Button(header, command=toggle_theme)
-theme_button.grid(row=0, column=3, rowspan=2, sticky="e")
+theme_button.grid(row=0, column=4, rowspan=2, sticky="e", padx=(8, 0))
+settings_button = ttk.Button(header, text="\u2699  Settings")
+settings_button.grid(row=0, column=3, rowspan=2, sticky="e")
 
 # ---- sidebar
 side = ttk.Frame(window, style="Side.TFrame", padding=14, width=320)
@@ -521,6 +524,141 @@ ttk.Label(footer, textvariable=status_var, style="Muted.TLabel", width=34).grid(
 progressbar = ttk.Progressbar(footer, mode="determinate")
 progressbar.grid(row=0, column=1, sticky="ew")
 
+# ---- settings page (covers sidebar + main area)
+SYSTEM_DEFAULT = "(system default)"
+pulse_var = tk.StringVar(value=settings.get("pulse_server", ""))
+backend_var = tk.StringVar(value=audio.BACKENDS.get(audio_cfg["backend"], audio.BACKENDS["auto"]))
+out_var = tk.StringVar()
+in_var = tk.StringVar()
+audio_diag_var = tk.StringVar()
+device_map = {"output": {}, "input": {}}
+
+settings_page = ttk.Frame(window, padding=(32, 24))
+settings_page.grid(row=1, column=0, columnspan=2, sticky="nsew")
+settings_page.columnconfigure(1, weight=1)
+ttk.Label(settings_page, text="Settings", font=("TkDefaultFont", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+ttk.Label(settings_page, text="Audio", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
+
+ttk.Label(settings_page, text="Audio system").grid(row=2, column=0, sticky="w", pady=6, padx=(0, 16))
+backend_box = ttk.Combobox(settings_page, textvariable=backend_var, state="readonly", values=list(audio.BACKENDS.values()))
+backend_box.grid(row=2, column=1, sticky="ew")
+
+ttk.Label(settings_page, text="Output device").grid(row=3, column=0, sticky="w", pady=6, padx=(0, 16))
+out_box = ttk.Combobox(settings_page, textvariable=out_var, state="readonly")
+out_box.grid(row=3, column=1, sticky="ew")
+test_out_button = ttk.Button(settings_page, text="Play test sound")
+test_out_button.grid(row=3, column=2, padx=(8, 0))
+
+ttk.Label(settings_page, text="Input device").grid(row=4, column=0, sticky="w", pady=6, padx=(0, 16))
+in_box = ttk.Combobox(settings_page, textvariable=in_var, state="readonly")
+in_box.grid(row=4, column=1, sticky="ew")
+test_in_button = ttk.Button(settings_page, text="Record 3 s test")
+test_in_button.grid(row=4, column=2, padx=(8, 0))
+
+ttk.Label(settings_page, text="PulseAudio server").grid(row=5, column=0, sticky="w", pady=6, padx=(0, 16))
+ttk.Entry(settings_page, textvariable=pulse_var).grid(row=5, column=1, sticky="ew")
+ttk.Label(settings_page, text="Optional (PULSE_SERVER), e.g. unix:/mnt/wslg/PulseServer or tcp:192.168.1.5. Leave empty for the default.",
+          style="Muted.TLabel").grid(row=6, column=1, sticky="w")
+
+refresh_dev_button = ttk.Button(settings_page, text="Apply / refresh devices")
+refresh_dev_button.grid(row=7, column=0, columnspan=3, sticky="w", pady=(16, 0))
+ttk.Label(settings_page, textvariable=audio_diag_var, wraplength=760, justify="left").grid(
+    row=8, column=0, columnspan=3, sticky="w", pady=(16, 0))
+
+def selected_backend():
+    return next((k for k, v in audio.BACKENDS.items() if v == backend_var.get()), "auto")
+
+def refresh_devices(*_):
+    audio_cfg["backend"] = selected_backend()
+    audio.set_pulse_server(pulse_var.get())
+    for direction, box, var in (("output", out_box, out_var), ("input", in_box, in_var)):
+        backend = audio.resolve(audio_cfg["backend"], direction)
+        mapping = {SYSTEM_DEFAULT: ""}
+        if backend:
+            for dev_id, label in audio.list_devices(backend, direction):
+                if backend == "windows" or dev_id.startswith(("auto_null",)):
+                    continue  # the Windows entry IS the system default; dummy devices are useless
+                mapping[label if label not in mapping else f"{label} ({dev_id})"] = dev_id
+        device_map[direction] = mapping
+        box.configure(values=list(mapping))
+        cur = audio_cfg[direction]
+        var.set(next((d for d, n in mapping.items() if n == cur), SYSTEM_DEFAULT))
+        if cur not in mapping.values():
+            audio_cfg[direction] = ""
+    audio_diag_var.set(audio.diagnose(audio_cfg["backend"]))
+
+def apply_devices(*_):
+    audio_cfg["backend"] = selected_backend()
+    audio_cfg["output"] = device_map["output"].get(out_var.get(), "")
+    audio_cfg["input"] = device_map["input"].get(in_var.get(), "")
+
+backend_box.bind("<<ComboboxSelected>>", lambda e: (audio_cfg.update(output="", input=""), refresh_devices()))
+out_box.bind("<<ComboboxSelected>>", apply_devices)
+in_box.bind("<<ComboboxSelected>>", apply_devices)
+refresh_dev_button.configure(command=lambda: (apply_devices(), refresh_devices()))
+
+def make_test_tone(path, seconds=1.0, rate=22050):
+    import wave
+    t = np.arange(int(seconds * rate)) / rate
+    env = np.minimum(1, np.minimum(t, seconds - t) * 20)
+    data = (0.3 * np.sin(2 * np.pi * 440 * t) * env * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(data.tobytes())
+
+def play_test_sound():
+    apply_devices()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    p = OUTPUT_DIR / "test-tone.wav"
+    make_test_tone(p)
+    play_file(p)
+
+def record_sample(seconds, dest, on_done):
+    """Record from the selected input in a thread; on_done(ok, error) runs on the Tk thread."""
+    apply_devices()
+    cfg = dict(audio_cfg)
+    state["status"] = f"Recording {seconds} s..."
+    def run():
+        ok, err = audio.record(seconds, dest, cfg["backend"], cfg["input"])
+        ui(on_done, ok, err)
+    threading.Thread(target=run, daemon=True).start()
+
+def test_input():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    p = OUTPUT_DIR / "mic-test.wav"
+    test_in_button.state(["disabled"])
+    def done(ok, err):
+        import wave
+        test_in_button.state(["!disabled"])
+        state["status"] = "Ready"
+        if not ok:
+            messagebox.showerror(APP_NAME, "Recording failed.\n" + err)
+            return
+        with wave.open(str(p)) as w:
+            raw = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+        peak = int(np.abs(raw).max()) * 100 // 32767 if raw.size else 0
+        audio_diag_var.set(f"Recorded 3 s, peak level {peak}%. "
+                           + ("Playing it back..." if peak > 0 else "\u26a0 Only silence was captured - check the input device."))
+        if peak > 0:
+            play_file(p)
+    record_sample(3, p, done)
+
+test_out_button.configure(command=play_test_sound)
+test_in_button.configure(command=test_input)
+
+def show_settings(show):
+    if show:
+        refresh_devices()
+        settings_page.grid()
+        settings_page.tkraise()
+        settings_button.configure(text="\u2190  Back")
+    else:
+        apply_devices()
+        settings_page.grid_remove()
+        settings_button.configure(text="\u2699  Settings")
+settings_button.configure(command=lambda: show_settings(not settings_page.winfo_viewable()))
+settings_page.grid_remove()
+refresh_devices()
+
 # ---------------------------------------------------------------- behaviour
 def refresh_controls():
     busy = state["busy"]
@@ -662,6 +800,8 @@ def on_closing():
     save_settings({
         "theme": theme_name, "model": current_model.get(), "vocoder": vocoder_var.get(),
         "language": lang_var.get(), "speaker": speaker_var.get(), "ref_wav": ref_var.get(),
+        "audio_backend": audio_cfg["backend"], "output_device": audio_cfg["output"], "input_device": audio_cfg["input"],
+        "pulse_server": pulse_var.get().strip(),
         "cuda": bool(cuda_var.get()), "geometry": window.geometry(), "text": inputbox.get("1.0", "end-1c"),
     })
     window.destroy()
