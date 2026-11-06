@@ -13,6 +13,7 @@ import simpleaudio as sa
 
 # ---- background synthesis with download progress ----
 import threading
+from pathlib import Path
 import TTS.utils.manage as ttsmanage
 
 _state = {"status": "", "done": 0, "total": 0, "finished": False, "error": None}
@@ -34,8 +35,33 @@ class _GuiTqdm:
 
 ttsmanage.tqdm = _GuiTqdm
 
+_tos = {"event": threading.Event(), "answer": False, "pending": False}
+
+def _gui_ask_tos(model_full_path):
+    """Replaces ModelManager.ask_tos: asks in a GUI dialog instead of the terminal.
+    Runs in the worker thread; the dialog itself is shown by _poll in the main thread."""
+    _tos["event"].clear()
+    _tos["pending"] = True
+    _tos["event"].wait()
+    if _tos["answer"]:
+        with open(Path(model_full_path) / "tos_agreed.txt", "w", encoding="utf-8") as f:
+            f.write("I have read, understood and agreed to the Terms and Conditions.")
+    return _tos["answer"]
+
+ModelManager.ask_tos = staticmethod(_gui_ask_tos)
+
 def _poll():
     statuslabel.config(text=_state["status"])
+    if _tos["pending"]:
+        _tos["pending"] = False
+        _tos["answer"] = messagebox.askyesno(
+            title="Terms of service",
+            message="You must confirm the following:\n\n"
+                    "\u2022 I have purchased a commercial license from Coqui: licensing@coqui.ai\n"
+                    "\u2022 Otherwise, I agree to the terms of the non-commercial CPML:\n"
+                    "   https://tts-hub.github.io/cpml\n\n"
+                    "Do you agree?")
+        _tos["event"].set()
     if _state["total"]:
         progressbar.config(mode="determinate", maximum=_state["total"], value=_state["done"])
     elif _state["status"].startswith("Downloading"):
