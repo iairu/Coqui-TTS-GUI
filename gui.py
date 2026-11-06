@@ -222,3 +222,6 @@ exportbutton = ttk.Button(window, width=20, text="Export audio", command=exporta
 exportbutton.grid(column=2, columnspan=1, row=16, padx=10, pady=12)
 def loadgui():
     window.mainloop()
+
+if __name__ == "__main__":
+    loadgui()
