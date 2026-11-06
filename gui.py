@@ -8,52 +8,94 @@ from tkinter import filedialog
 from tkinter import messagebox
 from TTS.utils.synthesizer import Synthesizer
 from TTS.utils.manage import ModelManager
-from pathlib import Path
 import os
 import simpleaudio as sa
+
+# ---- background synthesis with download progress ----
+import threading
+import TTS.utils.manage as ttsmanage
+
+_state = {"status": "", "done": 0, "total": 0, "finished": False, "error": None}
+
+class _GuiTqdm:
+    """Replaces tqdm inside TTS.utils.manage so downloads report to the GUI progress bar."""
+    def __init__(self, *args, total=0, **kwargs):
+        _state["done"], _state["total"] = 0, total or 0
+    def update(self, n=1):
+        _state["done"] += n
+    def close(self):
+        pass
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+    def write(self, *a, **k):
+        pass
+
+ttsmanage.tqdm = _GuiTqdm
+
+def _poll():
+    statuslabel.config(text=_state["status"])
+    if _state["total"]:
+        progressbar.config(mode="determinate", maximum=_state["total"], value=_state["done"])
+    elif _state["status"].startswith("Downloading"):
+        progressbar.config(mode="indeterminate")
+        progressbar.step(3)
+    else:
+        progressbar.config(mode="determinate", value=0)
+    if _state["finished"]:
+        progressbar.config(mode="determinate", value=0)
+        generatebutton.config(state="normal")
+        exportbutton.config(state="normal")
+        if _state["error"]:
+            messagebox.showerror(message=f"Error: {_state['error']}")
+            statuslabel.config(text="Error")
+        else:
+            statuslabel.config(text="Done")
+        return
+    window.after(100, _poll)
+
+def _download(manager, kind, name):
+    full = f"{kind}/{name}"
+    _state.update(status=f"Downloading {full} (if not cached)...", done=0, total=0)
+    model_path, config_path, _ = manager.download_model(full)
+    _state["total"] = 0
+    return model_path, config_path
+
+def _worker(text, cuda, outfile, play):
+    try:
+        manager = ModelManager(progress_bar=True)
+        model_path, config_path = _download(manager, "tts_models", tts_name)
+        vocoder_path, vocoder_config_path = _download(manager, "vocoder_models", vocoder_name)
+        _state["status"] = "Loading models..."
+        synthesizer = Synthesizer(tts_checkpoint=str(model_path), tts_config_path=str(config_path), vocoder_checkpoint=str(vocoder_path), vocoder_config=str(vocoder_config_path), use_cuda=cuda)
+        _state["status"] = "Synthesizing..."
+        wav = synthesizer.tts(text)
+        synthesizer.save_wav(wav, outfile)
+        if play:
+            _state["status"] = "Playing..."
+            sa.WaveObject.from_wave_file(outfile).play().wait_done()
+            os.remove(outfile)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _state["error"] = str(e)
+    _state["finished"] = True
+
+def _start(outfile, play):
+    global tts_name, vocoder_name
+    tts_name, vocoder_name = ttsmodelbox.get(), vocodermodelbox.get()
+    generatebutton.config(state="disabled")
+    exportbutton.config(state="disabled")
+    _state.update(status="Starting...", done=0, total=0, finished=False, error=None)
+    threading.Thread(target=_worker, args=(inputbox.get("1.0", "end-1c"), cudacheckbutton.instate(['selected']), outfile, play), daemon=True).start()
+    _poll()
 
 def generate():
     if inputbox.get("1.0", "end-1c") == "":
         messagebox.showerror(message="TTS will give a division by zero error if the text field is blank.")
-    else:
-        if not os.path.exists('coqui-tts-output'):
-            try:
-                os.makedirs('coqui-tts-output')
-            except OSError as e:
-                if e.errno != e.errno.EEXIST:
-                    raise
-        generatebutton.config(state="disabled")
-        exportbutton.config(state="disabled")
-        model_path = None
-        config_path = None
-        vocoder_path = None
-        vocoder_config_path = None
-        path = Path(__file__).parent / "../.models.json"
-        manager = ModelManager(path)
-        model_name = 'tts_models/' + ttsmodelbox.get()
-        print(f'model_name is {model_name}')
-        # for dev
-        #model_path, config_path, model_item = manager.download_model(model_name)
-        # for master
-        model_path, config_path, _ = manager.download_model(model_name)
-        vocoder_name = 'vocoder_models/' + vocodermodelbox.get()
-        print(f'vocoder_name is {vocoder_name}')
-        # for dev
-        #vocoder_path, vocoder_config_path, model_item = manager.download_model(vocoder_name)
-        # for master
-        vocoder_path, vocoder_config_path, _ = manager.download_model(vocoder_name)
-        synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, cudacheckbutton.instate(['selected']))
-        wav = synthesizer.tts(inputbox.get("1.0", "end-1c"))
-        synthesizer.save_wav(wav, "coqui-tts-output/generated.wav")
-        filename = "coqui-tts-output/generated.wav"
-        wave_obj = sa.WaveObject.from_wave_file(filename)
-        play_obj = wave_obj.play()
-        play_obj.wait_done()  # Wait until sound has finished playing
-        generatebutton.config(state="enabled")
-        exportbutton.config(state="enabled")
-        if os.path.exists("coqui-tts-output/generated.wav"):
-            os.remove("coqui-tts-output/generated.wav")
-        print("All done!")
+        return
+    os.makedirs('coqui-tts-output', exist_ok=True)
+    _start("coqui-tts-output/generated.wav", True)
 
 def savetext():
     f = filedialog.asksaveasfile(mode='w', defaultextension=".txt", filetypes=[("Text files", ".txt")])
@@ -87,36 +129,13 @@ def savetextandclose():
 def exportaudio():
     if inputbox.get("1.0", "end-1c") == "":
         messagebox.showerror(message="TTS will give a division by zero error if the text field is blank.")
-    else:
-        f = filedialog.asksaveasfile(mode='a', defaultextension=".wav", filetypes=[("Wave files", ".wav")])
-        if f is None: # asksaveasfile return `None` if dialog closed with "cancel".
-            return
-    generatebutton.config(state="disabled")
-    exportbutton.config(state="disabled")
-    model_path = None
-    config_path = None
-    vocoder_path = None
-    vocoder_config_path = None
-    path = Path(__file__).parent / "../.models.json"
-    manager = ModelManager(path)
-    model_name = 'tts_models/' + ttsmodelbox.get()
-    print(f'model_name is {model_name}')
-    # for dev
-    #model_path, config_path, model_item = manager.download_model(model_name)
-    # for master
-    model_path, config_path, _ = manager.download_model(model_name)
-    vocoder_name = 'vocoder_models/' + vocodermodelbox.get()
-    print(f'vocoder_name is {vocoder_name}')
-    # for dev
-    #vocoder_path, vocoder_config_path, model_item = manager.download_model(vocoder_name)
-    # for master
-    vocoder_path, vocoder_config_path, _ = manager.download_model(vocoder_name)
-    synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, cudacheckbutton.instate(['selected']))
-    wav = synthesizer.tts(inputbox.get("1.0", "end-1c"))
-    synthesizer.save_wav(wav, str(f.name))
-    generatebutton.config(state="enabled")
-    exportbutton.config(state="enabled")
-    print("All done!")
+        return
+    f = filedialog.asksaveasfile(mode='a', defaultextension=".wav", filetypes=[("Wave files", ".wav")])
+    if f is None: # asksaveasfile return `None` if dialog closed with "cancel".
+        return
+    name = f.name
+    f.close()
+    _start(name, False)
 
 def opentext():
     file = filedialog.askopenfile(mode='rt', defaultextension=".txt", filetypes=[("Text files", ".txt")])
@@ -220,6 +239,12 @@ savetextbutton = ttk.Button(window, width=20, text="Save text", command=savetext
 savetextbutton.grid(column=1, columnspan=1, row=16, padx=10, pady=12)
 exportbutton = ttk.Button(window, width=20, text="Export audio", command=exportaudio)
 exportbutton.grid(column=2, columnspan=1, row=16, padx=10, pady=12)
+# Status + progress bar
+statuslabel = ttk.Label(window, text="", font=("Tahoma", 10))
+statuslabel.grid(column=0, columnspan=3, row=18, padx=10, pady=(0, 4))
+progressbar = ttk.Progressbar(window, length=500, mode="determinate")
+progressbar.grid(column=0, columnspan=3, row=19, padx=10, pady=(0, 12))
+
 def loadgui():
     window.mainloop()
 
